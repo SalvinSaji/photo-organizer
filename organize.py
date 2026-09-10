@@ -92,6 +92,72 @@ def stat_oldest(p: Path):
     return datetime.fromtimestamp(min(cands))
 
 
+ISO6709_RE = re.compile(r"([+-]\d{2,3}\.\d+)([+-]\d{2,3}\.\d+)/?")
+FILENAME_DATE_RE = re.compile(r"(19|20)(\d{2})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{2})")
+
+
+def filename_date(p: Path):
+    """Date from camera filenames like IMG_20240809_225554 / PXL_20250303_225733671."""
+    m = FILENAME_DATE_RE.search(p.name)
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1) + m.group(2)), int(m.group(3)),
+                        int(m.group(4)), int(m.group(5)), int(m.group(6)),
+                        int(m.group(7)))
+    except ValueError:
+        return None
+
+
+def probe_video(p: Path):
+    """ffprobe GPS + creation_time for videos. mdls misses mp4 GPS on ExFAT.
+    Returns (lat, lon, datetime|None); (None, None, None) if unavailable."""
+    if shutil.which("ffprobe") is None:
+        return None, None, None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries",
+             "format_tags=location:format_tags=creation_time",
+             "-of", "default=noprint_wrappers=1", str(p)],
+            capture_output=True, text=True, timeout=60,
+        )
+        out = r.stdout
+    except Exception:
+        return None, None, None
+    lat = lon = date = None
+    m = ISO6709_RE.search(out)
+    if m:
+        try:
+            lat, lon = float(m.group(1)), float(m.group(2))
+        except ValueError:
+            pass
+    m = re.search(r"creation_time=(\S+)", out)
+    if m:
+        ds = m.group(1).strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                date = datetime.strptime(ds, fmt)
+                break
+            except ValueError:
+                continue
+    return lat, lon, date
+
+
+def best_date(p: Path, mdls_date=None, probe_date=None):
+    """Date priority: EXIF/mdls -> video container -> camera filename -> filesystem."""
+    if mdls_date is not None:
+        return mdls_date
+    if probe_date is not None:
+        return probe_date
+    fd = filename_date(p)
+    if fd is not None:
+        return fd
+    try:
+        return stat_oldest(p)
+    except Exception:
+        return datetime.now()
+
+
 def sanitize(s: str):
     s = (s or "").strip().replace("/", "_").replace("\\", "_")
     s = re.sub(r'[<>:"|?*\x00-\x1f]', "_", s).strip(" .")
@@ -256,11 +322,14 @@ def process_batch(todo, dst_root: Path, cache, done: set, wr, done_f, save_cache
             continue
         try:
             lat, lon, d = run_mdls(p)
-            if d is None:
-                try:
-                    d = stat_oldest(p)
-                except Exception:
-                    d = datetime.now()
+            probe_d = None
+            if p.suffix.lower() in VIDEO_EXTS:
+                probe_lat, probe_lon, probe_d = probe_video(p)
+                if lat is None:
+                    lat = probe_lat
+                if lon is None:
+                    lon = probe_lon
+            d = best_date(p, d, probe_d)
             if lat is None or lon is None:
                 country, city = "NoGPS", "NoGPS"
             else:

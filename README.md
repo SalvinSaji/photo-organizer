@@ -6,9 +6,9 @@ Organizes a folder of photos/videos into:
 organized/Country/City/YYYY-MM-DD/filename.jpg
 ```
 
-* GPS via macOS built-in `mdls` (`kMDItemLatitude` / `kMDItemLongitude`)
-* Town + country via Nominatim/OpenStreetMap reverse-geocode (no API key)
-* Date via `mdls kMDItemContentCreationDate`, fallback to oldest of birth/mtime/ctime
+* GPS via macOS `mdls`, plus `ffprobe` for videos (`mdls` misses mp4 GPS on ExFAT)
+* Town + country via Nominatim/OpenStreetMap (no key), BigDataCloud fallback
+* Date priority: EXIF/mdls → video container time → camera filename → filesystem
 * No GPS files go to `NoGPS/NoGPS/YYYY-MM-DD/`
 
 No pip dependencies. macOS + `python3` only.

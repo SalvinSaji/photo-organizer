@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Repair files placed under UnknownCountry/UnknownCity by transient geocode failures.
+"""Repair misplaced files: UnknownCountry/UnknownCity (geocode failures) and
+NoGPS/NoGPS (mdls misses mp4 GPS on ExFAT; stat dates use copy time).
 
-Re-reads GPS from the moved files (EXIF survives move), re-geocodes with
-retries, moves to the correct Country/City/YYYY-MM folder.
+Re-reads GPS/date from the moved files (ffprobe for videos, camera-filename
+dates), re-geocodes with retries, moves to the correct Country/City/YYYY-MM
+folder. True-NoGPS files stay, possibly re-dated.
 
 Usage:
   python3 repair_unknown.py DST
@@ -29,7 +31,8 @@ def main():
         p for p in dst.rglob("*")
         if p.is_file() and not p.name.startswith(".")
         and p.suffix.lower() in organize.EXTS
-        and ("UnknownCountry" in p.parts or "UnknownCity" in p.parts)
+        and ("UnknownCountry" in p.parts or "UnknownCity" in p.parts
+             or "NoGPS" in p.parts)
     )
     print(f"found {len(targets)} misplaced files")
     if not targets:
@@ -52,7 +55,7 @@ def main():
     if Path("repair_log.csv").stat().st_size == 0:
         wr.writerow(["src", "dst", "lat", "lon", "country", "city"])
 
-    fixed = still_unknown = no_gps = 0
+    fixed = still_unknown = correct = 0
     try:
         for i, p in enumerate(targets, 1):
             print(f"[{i}/{len(targets)}] {p.name} ... ", end="", flush=True)
@@ -60,16 +63,30 @@ def main():
                 lat, lon, d = organize.run_mdls(p)
             except Exception:
                 lat = lon = d = None
-            if lat is None or lon is None:
-                print("no GPS in file, leaving")
-                wr.writerow([str(p), "", "", "", "", "NO-GPS"])
-                no_gps += 1
-                continue
-            if d is None:
+            probe_d = None
+            if p.suffix.lower() in organize.VIDEO_EXTS:
                 try:
-                    d = organize.stat_oldest(p)
+                    probe_lat, probe_lon, probe_d = organize.probe_video(p)
                 except Exception:
-                    d = datetime.now()
+                    probe_lat = probe_lon = None
+                if lat is None:
+                    lat = probe_lat
+                if lon is None:
+                    lon = probe_lon
+            d = organize.best_date(p, d, probe_d)
+            if lat is None or lon is None:
+                raw = dst / "NoGPS" / "NoGPS" / d.strftime(organize.DATE_FMT) / p.name
+                if raw == p:
+                    print("true NoGPS, already placed")
+                    correct += 1
+                    continue
+                dest = organize.unique_dest(raw)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(p), str(dest))
+                wr.writerow([str(p), str(dest), "", "", "NoGPS", "NoGPS-redated"])
+                print(f"true NoGPS, re-dated -> NoGPS/{d.strftime(organize.DATE_FMT)}/")
+                fixed += 1
+                continue
             country, city = organize.reverse_geocode(lat, lon, cache)
             if country == "UnknownCountry" or city == "UnknownCity":
                 print(f"still unknown ({lat},{lon}), leaving")
@@ -91,14 +108,18 @@ def main():
     finally:
         save_cache()
         log.close()
-    # remove emptied Unknown dirs
-    for d in sorted((dst / "UnknownCountry").rglob("*"), reverse=True):
-        try:
-            if d.is_dir() and not any(d.iterdir()):
-                d.rmdir()
-        except OSError:
-            pass
-    print(f"done: fixed={fixed} still_unknown={still_unknown} no_gps={no_gps}")
+    # remove emptied Unknown/NoGPS dirs
+    for top in ("UnknownCountry", "NoGPS"):
+        root = dst / top
+        if not root.is_dir():
+            continue
+        for d in sorted(root.rglob("*"), reverse=True):
+            try:
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            except OSError:
+                pass
+    print(f"done: fixed={fixed} already_correct={correct} still_unknown={still_unknown}")
 
 
 if __name__ == "__main__":
