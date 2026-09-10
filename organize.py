@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Organize photos/videos into Country/City/YYYY-MM-DD/ using mdls + BigDataCloud.
+"""Organize photos/videos into Country/City/YYYY-MM/ using mdls + Nominatim.
 
 Usage:
   python3 organize.py SRC DST [--move] [--dry-run] [--batch N] [--yes]
@@ -29,17 +29,21 @@ from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 
 DATE_FMT = "%Y-%m"  # YYYY-MM monthly buckets
 CACHE_FILE = "geocache.json"
 DONE_FILE = "organize_done.txt"
 LOG_FILE = "organize_log.csv"
 
-EXTS = {
+IMAGE_EXTS = {
     ".jpg", ".jpeg", ".heic", ".heif", ".png", ".dng", ".cr2", ".nef",
     ".arw", ".rw2", ".tif", ".tiff", ".webp", ".bmp", ".gif",
+}
+VIDEO_EXTS = {
     ".mov", ".mp4", ".m4v", ".avi", ".3gp", ".mts", ".mpg", ".mkv",
 }
+EXTS = IMAGE_EXTS | VIDEO_EXTS
 
 
 def run_mdls(p: Path):
@@ -94,23 +98,74 @@ def sanitize(s: str):
     return s[:80] if s else ""
 
 
+def _nominatim_lookup(lat, lon):
+    """Single Nominatim attempt. Returns (country, city), may be ("",""). Raises on HTTP/network error."""
+    q = urlencode({"format": "json", "lat": lat, "lon": lon, "zoom": 10,
+                   "accept-language": "en"})
+    url = f"https://nominatim.openstreetmap.org/reverse?{q}"
+    req = Request(url, headers={"User-Agent": "photo-organizer/1.0"})
+    with urlopen(req, timeout=20) as r:
+        j = json.loads(r.read().decode())
+    addr = j.get("address", {}) or {}
+    country = sanitize(addr.get("country") or "")
+    city = sanitize(
+        addr.get("city") or addr.get("town") or addr.get("village")
+        or addr.get("municipality") or addr.get("hamlet")
+        or addr.get("water") or addr.get("ocean")
+        or addr.get("county") or addr.get("state") or ""
+    )
+    time.sleep(1.1)  # Nominatim policy: max 1 req/sec
+    return country, city
+
+
+def _bigdatacloud_lookup(lat, lon):
+    """Single BigDataCloud client-endpoint attempt. Fallback only (bans server-side IPs)."""
+    q = urlencode({"latitude": lat, "longitude": lon, "localityLanguage": "en"})
+    url = f"https://api.bigdatacloud.net/data/reverse-geocode-client?{q}"
+    req = Request(url, headers={"User-Agent": "photo-organizer/1.0"})
+    with urlopen(req, timeout=20) as r:
+        j = json.loads(r.read().decode())
+    country = sanitize(j.get("countryName") or "")
+    city = sanitize(j.get("city") or j.get("locality") or j.get("principalSubdivision") or "")
+    time.sleep(0.5)
+    return country, city
+
+
 def reverse_geocode(lat, lon, cache):
+    # Provider chain: Nominatim primary (server-side OK), BigDataCloud fallback.
     # Round to 3 decimals (~100m) so bursts in same town hit cache, not API.
     key = f"{round(lat, 3)},{round(lon, 3)}"
     if key in cache:
         return cache[key]
-    q = urlencode({"latitude": lat, "longitude": lon, "localityLanguage": "en"})
-    url = f"https://api.bigdatacloud.net/data/reverse-geocode-client?{q}"
     country = city = ""
-    try:
-        req = Request(url, headers={"User-Agent": "photo-organizer"})
-        with urlopen(req, timeout=15) as r:
-            j = json.loads(r.read().decode())
-        country = sanitize(j.get("countryName") or "")
-        city = sanitize(j.get("city") or j.get("locality") or j.get("principalSubdivision") or "")
-        time.sleep(0.5)
-    except Exception as e:
-        print(f"\n  geocode fail {lat},{lon}: {e}")
+    chain = (("nominatim", _nominatim_lookup, 3),
+             ("bigdatacloud", _bigdatacloud_lookup, 2))
+    for name, fn, tries in chain:
+        if country and city:
+            break
+        for attempt in range(tries):
+            try:
+                c1, c2 = fn(lat, lon)
+            except HTTPError as e:
+                if e.code in (402, 403, 429):
+                    print(f"\n  {name} blocked (HTTP {e.code}), trying next provider")
+                    break
+                wait = 2 ** (attempt + 1)
+                print(f"\n  {name} fail {lat},{lon} (try {attempt + 1}/{tries}): {e} - retry in {wait}s")
+                time.sleep(wait)
+                continue
+            except Exception as e:
+                wait = 2 ** (attempt + 1)
+                print(f"\n  {name} fail {lat},{lon} (try {attempt + 1}/{tries}): {e} - retry in {wait}s")
+                time.sleep(wait)
+                continue
+            if not country:
+                country = c1
+            if not city:
+                city = c2
+            break
+    if not country or not city:
+        print(f"\n  geocode partial {lat},{lon} -> {country or '?'}/{city or '?'}")
     if not country:
         country = "UnknownCountry"
     if not city:
@@ -176,11 +231,13 @@ def progress_bar(done_n: int, total_n: int, start_t: float, label: str = ""):
     sys.stdout.flush()
 
 
-def scan_media(src: Path):
+def scan_media(src: Path, allowed=None):
     # Skip AppleDouble companions (._*.jpg on ExFAT) and any hidden dot-files.
+    if allowed is None:
+        allowed = EXTS
     return sorted(
         p for p in src.rglob("*")
-        if p.is_file() and p.suffix.lower() in EXTS and not p.name.startswith(".")
+        if p.is_file() and p.suffix.lower() in allowed and not p.name.startswith(".")
     )
 
 
@@ -273,7 +330,12 @@ def main():
     ap.add_argument("--batch", type=int, default=None, help="fixed batch size, loop without asking")
     ap.add_argument("--yes", action="store_true", help="process all remaining without asking")
     ap.add_argument("--no-resume", action="store_true", help="ignore organize_done.txt, start over")
+    ap.add_argument("--images-only", action="store_true", help="skip video files")
+    ap.add_argument("--videos-only", action="store_true", help="only video files")
     a = ap.parse_args()
+    if a.images_only and a.videos_only:
+        raise SystemExit("Pick only one of --images-only / --videos-only")
+    allowed = VIDEO_EXTS if a.videos_only else (IMAGE_EXTS if a.images_only else EXTS)
     src, dst_root = Path(a.src), Path(a.dst)
 
     if not src.is_dir():
@@ -308,9 +370,9 @@ def main():
     batch_no = 0
     try:
         while True:
-            files = scan_media(src)
+            files = scan_media(src, allowed)
             remaining = [p for p in files if str(p.resolve()) not in done and str(p) not in done]
-            print(f"\n=== found {len(files)} media files, {len(files) - len(remaining)} already done, {len(remaining)} remaining ===")
+            print(f"\n=== found {len(files)} {'image' if allowed is IMAGE_EXTS else ('video' if allowed is VIDEO_EXTS else 'media')} files, {len(files) - len(remaining)} already done, {len(remaining)} remaining ===")
             if not remaining:
                 print("All done!")
                 break

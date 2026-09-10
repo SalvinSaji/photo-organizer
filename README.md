@@ -7,7 +7,7 @@ organized/Country/City/YYYY-MM-DD/filename.jpg
 ```
 
 * GPS via macOS built-in `mdls` (`kMDItemLatitude` / `kMDItemLongitude`)
-* Town + country via BigDataCloud reverse-geocode (no API key)
+* Town + country via Nominatim/OpenStreetMap reverse-geocode (no API key)
 * Date via `mdls kMDItemContentCreationDate`, fallback to oldest of birth/mtime/ctime
 * No GPS files go to `NoGPS/NoGPS/YYYY-MM-DD/`
 
@@ -47,7 +47,7 @@ Rules:
 
 * Copy duplicates all bytes (slow, needs free space). Same-drive move is an instant rename.
 * `mdls` can return `(null)` for GPS/date if Spotlight hasn't indexed the drive - script falls back to filesystem date and `NoGPS`.
-* BigDataCloud free endpoint is rate-limited - script caches + throttles new lookups.
+* Nominatim allows 1 req/sec - script caches + throttles new lookups.
 
 ## Troubleshooting
 
