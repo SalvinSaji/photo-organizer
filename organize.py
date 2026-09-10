@@ -30,7 +30,7 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
 
-DATE_FMT = "%Y-%m-%d"  # sortable
+DATE_FMT = "%Y-%m"  # YYYY-MM monthly buckets
 CACHE_FILE = "geocache.json"
 DONE_FILE = "organize_done.txt"
 LOG_FILE = "organize_log.csv"
@@ -177,7 +177,11 @@ def progress_bar(done_n: int, total_n: int, start_t: float, label: str = ""):
 
 
 def scan_media(src: Path):
-    return sorted(p for p in src.rglob("*") if p.is_file() and p.suffix.lower() in EXTS)
+    # Skip AppleDouble companions (._*.jpg on ExFAT) and any hidden dot-files.
+    return sorted(
+        p for p in src.rglob("*")
+        if p.is_file() and p.suffix.lower() in EXTS and not p.name.startswith(".")
+    )
 
 
 def process_batch(todo, dst_root: Path, cache, done: set, wr, done_f, save_cache, dry_run: bool, move: bool):
